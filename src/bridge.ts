@@ -179,22 +179,41 @@ export function createZCodeBridge(services: BridgeServices, write: (message: unk
       services.observe?.({ event: 'runtime-headers-request', sessionId: s.id, requestId: params.requestId,
         generation: g, readsBefore: s.auth.reads, source: s.auth.source(), route: s.auth.account().route, accountPlan: s.auth.accountPlan(), providerId: s.auth.account().id, model: record(params.modelSelection).modelId });
       let headersApplied = false;
+      let stage: 'catalogue' | 'headers' = 'catalogue';
+      let available: string[] = [];
       void (async () => { try {
         const models = record(await services.models(s.cwd, s.auth.source(), s.auth.accountPlan())).models;
-        const available = Array.isArray(models) ? models.map(m => string(record(m).model)) : [];
+        available = Array.isArray(models) ? models.map(m => string(record(m).model)) : [];
         if (!current(s, g) || s.closing) return;
+        stage = 'headers';
         const result = await s.auth.runtimeHeaders(m.params, s.id, s.cwd, s.model, s.reasoning, available);
         if (!current(s, g) || s.closing) return;
         s.child.write({ jsonrpc: '2.0', id: m.id, result }); headersApplied = true; }
       catch (e) {
         if (e instanceof AuthError || e instanceof ProjectTokenError && ['project_token_login_failed', 'project_token_scope_invalidated'].includes(e.code)) services.invalidateCatalogue?.();
         if (!current(s, g) || s.closing) return;
+        const errorKind = e instanceof AuthError ? e.kind : e instanceof ProjectTokenError ? e.code
+          : e instanceof Error && e.message === 'Catalogue root changed or runtime/config scope changed; retry after reconciliation' ? 'catalogue-scope-changed'
+          : e instanceof Error && e.message === 'Catalogue root changed or services closed; retry on current root' ? 'catalogue-owner-changed' : 'other';
+        const safeRecord = (value: unknown): Record<string, unknown> => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
+        const model = safeRecord(params.modelSelection), access = safeRecord(params.accountAccess), workspace = safeRecord(params.workspace);
+        services.observe?.({ event: 'runtime-headers-error', threadId: s.threadId, sessionId: s.id, generation: g, stage, errorKind,
+          providerMatches: params.providerId === s.auth.account().id && model.providerId === s.auth.account().id,
+          accountMatches: access.type === 'zhipu-account' && access.mode === s.auth.account().mode && access.accountType === 'zai' && access.entitled === true,
+          modelAvailable: typeof model.modelId === 'string' && available.includes(model.modelId),
+          reasoningMatches: model.modelId !== s.model || model.options === undefined || s.reasoning === undefined || safeRecord(model.options).reasoningLevel === s.reasoning,
+          sessionMatches: params.sessionId === s.id, workspaceMatches: workspace.workspacePath === s.cwd && workspace.workspaceKey === s.cwd,
+          requestMatches: params.reason === 'model-request' && typeof params.requestId === 'string' && Boolean(params.requestId) });
         const missingLogin = (e instanceof AuthError && e.kind === 'unauthenticated') || (e instanceof ProjectTokenError && e.code === 'project_token_login_failed');
+        const message = missingLogin ? signInHint() : e instanceof UnsupportedPlanError ? e.message : e instanceof ProjectTokenError ? e.code
+          : stage === 'catalogue' ? 'ZCode model catalogue refresh failed; request authorization was not prepared.'
+          : e instanceof AuthError && e.kind === 'unsupported-mode' ? 'Native request model or account selection does not match the active session.'
+          : 'Native request authorization could not be prepared; inspect the credential store and session configuration.';
         s.child.write({ jsonrpc: '2.0', id: m.id, result: { headersApplied: false,
-          errorMessage: missingLogin ? signInHint() : e instanceof UnsupportedPlanError ? e.message : e instanceof ProjectTokenError ? e.code : 'Unsupported or invalid native auth input' } });
+          errorMessage: message } });
         if (missingLogin) authFailed(s);
         else send('thread/delta', { threadId: s.threadId, deltas: [threadDeltaSchema.parse({ kind: 'provider.error',
-          category: e instanceof UnsupportedPlanError ? 'bad-request' : 'unknown', message: e instanceof UnsupportedPlanError ? e.message : e instanceof ProjectTokenError ? e.code : 'Unsupported or invalid native auth input; inspect configuration' })] });
+          category: e instanceof UnsupportedPlanError ? 'bad-request' : 'unknown', message })] });
       }
       services.observe?.({ event: 'runtime-headers-result', sessionId: s.id, requestId: params.requestId,
         generation: g, readsAfter: s.auth.reads, source: s.auth.source(), route: s.auth.account().route, accountPlan: s.auth.accountPlan(), providerId: s.auth.account().id, headersApplied });

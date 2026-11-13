@@ -31,3 +31,28 @@ test('Desktop v2 OAuth fallback detects the signed-in account without changing c
     assert.throws(() => auth.read(), e => e.kind === 'invalid-store');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('catalogue failures are identified without leaking error contents', async () => {
+  const { resolve } = await import('node:path');
+  const { setTimeout: delay } = await import('node:timers/promises');
+  const dir = mkdtempSync(join(tmpdir(), 'zcode-auth-error-')), output = [], observed = [];
+  let child;
+  const auth = new api.ReadOnlyAuth(join(dir, 'unused'));
+  const bridge = api.createZCodeBridge({
+    prepare: async () => ({ auth, launch: { executable: process.execPath, args: [resolve('tests/provider/fake-v4.mjs'), 'v4'], cwd: dir, env: api.childEnvironment(process.env, {}) }, configure: async p => { child = p; } }),
+    models: async () => { throw new Error('SYNTHETIC_PRIVATE_ERROR'); },
+    validateSelection: async () => {}, health: async () => ({}), installation: async () => ({}), observe: e => observed.push(e),
+  }, m => output.push(m));
+  try {
+    bridge.handleLine(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'thread/start', params: { threadId: 'auth-error', cwd: dir, instructionMode: 'append', options: { model: 'GLM-5.3', reasoningLevel: 'high', permissionMode: 'full', permissionScope: 'full', approvalReviewer: null, permissionEscalation: null } } }));
+    for (let i = 0; i < 500 && !output.some(e => e.id === 1); i++) await delay(5);
+    assert.ok(output.find(e => e.id === 1)?.result);
+    await child.request('auth-bad', {});
+    for (let i = 0; i < 500 && !observed.some(e => e.event === 'runtime-headers-error'); i++) await delay(5);
+    const error = observed.find(e => e.event === 'runtime-headers-error');
+    assert.equal(error?.stage, 'catalogue');
+    assert.equal(error?.errorKind, 'other');
+    assert.ok(JSON.stringify(output).includes('model catalogue refresh failed'));
+    assert.ok(!JSON.stringify([output, observed]).includes('SYNTHETIC_PRIVATE_ERROR'));
+  } finally { await bridge.close(); rmSync(dir, { recursive: true, force: true }); }
+});
