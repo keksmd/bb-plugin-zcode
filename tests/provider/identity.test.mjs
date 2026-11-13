@@ -8,12 +8,12 @@ import { plugin } from './helpers.mjs';
 
 test('distinct manifest identity registers one provider/CLI and reads only its own plugin state with fresh defaults', async () => {
   const pkg = JSON.parse(readFileSync('package.json', 'utf8'));
-  assert.equal(pkg.name, 'bb-plugin-zcode-provider');
+  assert.equal(pkg.name, 'bb-plugin-zcode-fork');
   assert.equal(pkg.version, '0.2.3');
   assert.equal(pkg.bb.name, 'ZCode Provider');
   // Installed bb derives the ID from the final package-name component.
   const pluginId = pkg.name.split('/').at(-1).replace(/^bb-plugin-/, '').toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/^-+|-+$/g, '');
-  assert.equal(pluginId, 'zcode-provider');
+  assert.equal(pluginId, 'zcode-fork');
   const dataDir = mkdtempSync(join(tmpdir(), 'zcode-identity-'));
   const hosts = [];
   try {

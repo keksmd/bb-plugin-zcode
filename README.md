@@ -1,5 +1,13 @@
 # ZCode Provider for bb
 
+This fork installs as plugin `zcode-fork` while retaining provider ID
+`zcode-provider`. Disable the original plugin before enabling this fork; the
+original settings remain in its own plugin data. The fork reads the ZCode
+Desktop v2 Keychain credential format and uses the Z.ai OAuth profile when
+the per-provider identity is absent. macOS may ask to authorize Keychain access.
+Desktop 3.18.2 model discovery and a short GLM-5.3-Flash turn were verified;
+the full native compatibility suite still requires review for this version.
+
 Run your installed ZCode coding agent inside [bb](https://getbb.app) with an
 individual Z.ai Coding Plan: files, terminal tools, native skills and commands.
 [Russian edition](README.ru.md).
