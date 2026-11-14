@@ -8,6 +8,8 @@ type Task = { workId: string; key: string; closed: boolean; settled: boolean; de
 export class BackgroundTasks {
   private tasks = new Map<string, Task>();
   private ignored = new Set<string>();
+  private anchors = new Map<number, { rowId: number; turnId: string; workId: unknown; command?: string; backgroundText?: string }>();
+  private warnedAnchors = new Set<string>();
   private recovered: Task[] = [];
   private sessionId: string;
   private warn: Warn;
@@ -44,7 +46,19 @@ export class BackgroundTasks {
       status: taskStatus === 'completed' ? 'completed' : ['failed', 'killed'].includes(taskStatus) ? 'failed' : 'pending',
       taskStatus, skipTranscript: false };
   }
+  private rememberAnchors(s: Snapshot): void {
+    for (const row of s.rows.window) {
+      if (row.kind !== 'toolCall' || row.toolName !== 'Bash' || !row.turnId) continue;
+      const input = row.input && typeof row.input === 'object' && !Array.isArray(row.input) ? record(row.input) : {};
+      const output = row.output && typeof row.output === 'object' && !Array.isArray(row.output) ? record(row.output) : {};
+      this.anchors.set(row.rowId, { rowId: row.rowId, turnId: row.turnId, workId: row.workId,
+        ...(typeof input.command === 'string' ? { command: input.command } : {}),
+        ...(row.status === 'success' && input.run_in_background === true && typeof output.text === 'string' ? { backgroundText: output.text } : {}) });
+      if (this.anchors.size > 256) this.anchors.delete(this.anchors.keys().next().value!);
+    }
+  }
   baseline(s: Snapshot): ThreadDelta[] {
+    this.rememberAnchors(s);
     for (const w of Array.isArray(s.backgroundWorks) ? s.backgroundWorks : []) {
       const v = record(w); if (typeof v.workId === 'string') this.ignored.add(v.workId);
     }
@@ -63,6 +77,7 @@ export class BackgroundTasks {
   project(s: Snapshot, foregroundBoundary = false): ThreadDelta[] {
     const output: ThreadDelta[] = [], seen = new Set<string>();
     const emit = (value: unknown) => output.push(threadDeltaSchema.parse(value));
+    this.rememberAnchors(s);
     for (const value of Array.isArray(s.backgroundWorks) ? s.backgroundWorks : []) {
       const w = record(value);
       if (w.kind !== 'bash') continue;
@@ -75,18 +90,17 @@ export class BackgroundTasks {
       let task = this.tasks.get(w.workId);
       if (task?.closed) continue;
       if (!task) {
-        const anchor = s.rows.window.find(r => r.kind === 'toolCall' && r.toolName === 'Bash' &&
-          (r.workId === w.workId || r.rowId === w.anchorRowId ||
-            // Installed0.16.9 omits optional workId/backgrounded and reports a
-            // null anchor. Exact native model-content prefix is source-backed
-            // by29628c9 bash-model-content120-142 and actual M3 recording.
-            (r.status === 'success' && r.input && typeof r.input === 'object' && !Array.isArray(r.input) &&
-              record(r.input).run_in_background === true && r.output && typeof r.output === 'object' &&
-              typeof record(r.output).text === 'string' &&
-              String(record(r.output).text).startsWith(`Command running in background with ID: ${w.workId}.`))));
-        if (!anchor?.turnId) { this.warn({ code: 'background-anchor-unavailable' }, w.workId); continue; }
+        const anchor = [...this.anchors.values()].find(r => r.workId === w.workId || r.rowId === w.anchorRowId ||
+          r.backgroundText?.startsWith(`Command running in background with ID: ${w.workId}.`));
+        if (!anchor) {
+          if ((foregroundBoundary || w.status !== 'running') && !this.warnedAnchors.has(w.workId)) {
+            this.warnedAnchors.add(w.workId);
+            this.warn({ code: 'background-anchor-unavailable' }, w.workId);
+          }
+          continue;
+        }
         task = { workId: w.workId, key: this.key(w.workId), closed: false, settled: false,
-          description: typeof record(anchor.input).command === 'string' ? String(record(anchor.input).command) : w.title, status: 'running', signature: '' };
+          description: anchor.command ?? w.title, status: 'running', signature: '' };
         this.tasks.set(w.workId, task); this.persist();
         emit({ kind: 'item.open', providerTurnId: anchor.turnId, key: { providerItemId: task.key }, item: this.shape(task, 'running', task.description) });
       }

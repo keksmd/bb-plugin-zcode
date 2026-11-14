@@ -5,6 +5,7 @@ import { createBridgeIo, createBridgeLineHandler, runBridgeRequest,
   threadStartParamsSchema, threadResumeParamsSchema, threadStopParamsSchema,
   turnStartParamsSchema, turnSteerParamsSchema, threadDiscardParamsSchema, PROVIDER_BRIDGE_PROTOCOL_VERSION,
   providerRecoveryNotificationSchema, threadDeltaSchema, skillsConfigureParamsSchema } from '@get-bb/plugin-sdk/provider-bridge';
+import type { ThreadDelta } from '@get-bb/plugin-sdk/provider-bridge';
 import { NativeProcess, MissingExecutableError } from './process.ts';
 import type { Launch } from './process.ts';
 import { FrameDecoder } from './framing.ts';
@@ -53,12 +54,12 @@ export interface BridgeServices {
   usage?: () => Promise<unknown>;
   catalogue?: (cwd?: string, mode?: AuthMode) => Promise<unknown>;
   models: (cwd?: string, mode?: AuthMode, plan?: AccountPlan) => Promise<unknown>;
-  validateSelection: (model: string, reasoning: string, mode?: AuthMode, plan?: AccountPlan) => Promise<void | { model: string; reasoning: string }>;
+  validateSelection: (model: string, reasoning: string, mode?: AuthMode, plan?: AccountPlan) => Promise<void | { model: string; reasoning: string; availableModels?: string[] }>;
 }
 export interface RuntimeSetup { warnings?: readonly string[] | undefined; beforeInput?: (() => Promise<void>) | undefined }
 export interface RuntimeSetup { mentionCatalogue?: ((side: 'skills' | 'commands') => Promise<unknown>) | undefined; backgroundTaskStore?: string | undefined }
 export interface RuntimeSetup { knowledgeStore?: string | undefined }
-type Session = { threadId: string; id: string; cwd: string; model: string; reasoning: string; generation: number; child: NativeProcess;
+type Session = { threadId: string; id: string; cwd: string; model: string; reasoning: string; availableModels: string[] | undefined; generation: number; child: NativeProcess;
   auth: ReadOnlyAuth; refreshAuth: RuntimeSetup['refreshAuth']; beforeInput: RuntimeSetup['beforeInput']; state: ConversationState; decoder: FrameDecoder; lifecycle: SessionLifecycle | null;
   correlation: CommandCorrelation; detached: boolean; closing: boolean; subscription: string | null; options: string;
   construction: Record<string, unknown>; memoryEnabled: boolean; instructionMode: string; timers: Map<string, ReturnType<typeof setTimeout>>;
@@ -72,6 +73,7 @@ type Session = { threadId: string; id: string; cwd: string; model: string; reaso
   skillRoots: SkillRoot[];
   bbSkills: BbSkill[];
   mentionCatalogues: Map<string, Promise<unknown>>;
+  deferredHeaderFailure?: { commandId: string; error: Extract<ThreadDelta, { kind: 'provider.error' }> };
   stopping?: Promise<void> };
 
 export function createZCodeBridge(services: BridgeServices, write: (message: unknown) => void) {
@@ -117,6 +119,14 @@ export function createZCodeBridge(services: BridgeServices, write: (message: unk
     const compactTurns = new Set(snapshot.rows.window.filter(r => r.kind === 'turnHeader' && s.compactions.owns(r.sourceCommandId)).map(r => r.turnId));
     const ordinarySnapshot = compactTurns.size ? { ...snapshot, rows: { ...snapshot.rows,
       window: snapshot.rows.window.filter(r => !compactTurns.has(r.turnId)) } } : snapshot;
+    if (s.deferredHeaderFailure) {
+      const failure = s.deferredHeaderFailure;
+      const header = ordinarySnapshot.rows.window.find(row => row.kind === 'turnHeader' && row.sourceCommandId === failure.commandId);
+      if (header?.turnId) {
+        s.lifecycle.requestFailure(header.turnId, failure.error, s.generation, s.id);
+        delete s.deferredHeaderFailure;
+      }
+    }
     s.lifecycle.project(ordinarySnapshot, s.generation, s.id, s.correlation);
     s.compactions.project(snapshot);
     for (const [id, timer] of s.timers) if (!['pending', 'unknown'].includes(s.correlation.status(id) ?? '')) {
@@ -178,16 +188,28 @@ export function createZCodeBridge(services: BridgeServices, write: (message: unk
       const params = record(m.params);
       services.observe?.({ event: 'runtime-headers-request', sessionId: s.id, requestId: params.requestId,
         generation: g, readsBefore: s.auth.reads, source: s.auth.source(), route: s.auth.account().route, accountPlan: s.auth.accountPlan(), providerId: s.auth.account().id, model: record(params.modelSelection).modelId });
+      const running = s.state.snapshot?.rows.window.filter(row => row.kind === 'turnHeader' && row.state === 'running' && !s.compactions.owns(row.sourceCommandId)) ?? [];
+      const requestTurnId = running.length === 1 ? running[0]!.turnId : undefined;
+      const pendingCommands = requestTurnId ? [] : s.correlation.unresolved(g);
+      const requestCommandId = pendingCommands.length === 1 ? pendingCommands[0]!.commandId : undefined;
+      const requestTurn = () => s.state.snapshot?.rows.window.find(row => row.kind === 'turnHeader' && row.state === 'running' &&
+        !s.compactions.owns(row.sourceCommandId) && (requestTurnId ? row.turnId === requestTurnId : requestCommandId !== undefined && row.sourceCommandId === requestCommandId))?.turnId;
       let headersApplied = false;
       let stage: 'catalogue' | 'headers' = 'catalogue';
       let available: string[] = [];
       void (async () => { try {
-        const models = record(await services.models(s.cwd, s.auth.source(), s.auth.accountPlan())).models;
-        available = Array.isArray(models) ? models.map(m => string(record(m).model)) : [];
+        if (s.auth.accountPlan() === 'coding-plan' && s.availableModels) available = s.availableModels;
+        else {
+          const models = record(await services.models(s.cwd, s.auth.source(), s.auth.accountPlan())).models;
+          available = Array.isArray(models) ? models.map(m => string(record(m).model)) : [];
+        }
         if (!current(s, g) || s.closing) return;
         stage = 'headers';
         const result = await s.auth.runtimeHeaders(m.params, s.id, s.cwd, s.model, s.reasoning, available);
         if (!current(s, g) || s.closing) return;
+        const successfulTurnId = requestTurn();
+        if (successfulTurnId) s.lifecycle?.requestFailure(successfulTurnId, undefined, g, s.id);
+        if (requestCommandId && s.deferredHeaderFailure?.commandId === requestCommandId) delete s.deferredHeaderFailure;
         s.child.write({ jsonrpc: '2.0', id: m.id, result }); headersApplied = true; }
       catch (e) {
         if (e instanceof AuthError || e instanceof ProjectTokenError && ['project_token_login_failed', 'project_token_scope_invalidated'].includes(e.code)) services.invalidateCatalogue?.();
@@ -197,7 +219,10 @@ export function createZCodeBridge(services: BridgeServices, write: (message: unk
           : e instanceof Error && e.message === 'Catalogue root changed or services closed; retry on current root' ? 'catalogue-owner-changed' : 'other';
         const safeRecord = (value: unknown): Record<string, unknown> => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
         const model = safeRecord(params.modelSelection), access = safeRecord(params.accountAccess), workspace = safeRecord(params.workspace);
+        const failedTurnId = requestTurn();
         services.observe?.({ event: 'runtime-headers-error', threadId: s.threadId, sessionId: s.id, generation: g, stage, errorKind,
+          requestTurnId: failedTurnId ?? null, capturedTurn: requestTurnId !== undefined, capturedCommand: requestCommandId !== undefined,
+          ...(e instanceof ProjectTokenError ? { transient: e.transient, transport: e.diagnostics } : {}),
           providerMatches: params.providerId === s.auth.account().id && model.providerId === s.auth.account().id,
           accountMatches: access.type === 'zhipu-account' && access.mode === s.auth.account().mode && access.accountType === 'zai' && access.entitled === true,
           modelAvailable: typeof model.modelId === 'string' && available.includes(model.modelId),
@@ -205,6 +230,27 @@ export function createZCodeBridge(services: BridgeServices, write: (message: unk
           sessionMatches: params.sessionId === s.id, workspaceMatches: workspace.workspacePath === s.cwd && workspace.workspaceKey === s.cwd,
           requestMatches: params.reason === 'model-request' && typeof params.requestId === 'string' && Boolean(params.requestId) });
         const missingLogin = (e instanceof AuthError && e.kind === 'unauthenticated') || (e instanceof ProjectTokenError && e.code === 'project_token_login_failed');
+        const requestStillRunning = failedTurnId !== undefined;
+        const boundRequest = params.providerId === s.auth.account().id && model.providerId === s.auth.account().id && model.modelId === s.model &&
+          access.type === 'zhipu-account' && access.mode === s.auth.account().mode && access.accountType === 'zai' && access.entitled === true &&
+          (model.options === undefined || s.reasoning === undefined || safeRecord(model.options).reasoningLevel === s.reasoning) &&
+          params.sessionId === s.id && workspace.workspacePath === s.cwd && workspace.workspaceKey === s.cwd &&
+          params.reason === 'model-request' && typeof params.requestId === 'string' && Boolean(params.requestId);
+        const retryCategory = errorKind === 'catalogue-scope-changed' ? 'internal'
+          : e instanceof ProjectTokenError && e.code === 'project_token_request_failed' && e.transient ? 'connection-failed' : undefined;
+        if (boundRequest && retryCategory) {
+          const failure: Extract<ThreadDelta, { kind: 'provider.error' }> = {
+            kind: 'provider.error', category: retryCategory,
+            errorInfo: { category: retryCategory, providerCode: errorKind, httpStatusCode: null },
+            message: 'Temporary ZCode request preparation failure. bb can resume this turn automatically when provider retry is enabled.',
+          };
+          if (failedTurnId) s.lifecycle?.requestFailure(failedTurnId, failure, g, s.id);
+          else if (requestCommandId && s.correlation.unresolved(g).some(command => command.commandId === requestCommandId))
+            s.deferredHeaderFailure = { commandId: requestCommandId, error: failure };
+        } else {
+          if (requestStillRunning) s.lifecycle?.requestFailure(failedTurnId, undefined, g, s.id);
+          if (requestCommandId && s.deferredHeaderFailure?.commandId === requestCommandId) delete s.deferredHeaderFailure;
+        }
         const message = missingLogin ? signInHint() : e instanceof UnsupportedPlanError ? e.message : e instanceof ProjectTokenError ? e.code
           : stage === 'catalogue' ? 'ZCode model catalogue refresh failed; request authorization was not prepared.'
           : e instanceof AuthError && e.kind === 'unsupported-mode' ? 'Native request model or account selection does not match the active session.'
@@ -353,11 +399,12 @@ export function createZCodeBridge(services: BridgeServices, write: (message: unk
     if (sessions.has(threadId)) throw new Error('Thread already attached');
     if (!resume && createdIdentities.has(threadId)) throw new Error('Created native identity requires recovery/resume; no duplicate create');
     const setup = await services.prepare(cwd, execution, { threadId, ...(resume ? { providerThreadId: string(p.providerThreadId) } : {}) });
-    Object.assign(execution, await services.validateSelection(execution.model, execution.reasoning, execution.authMode, execution.accountPlan));
+    const selection = await services.validateSelection(execution.model, execution.reasoning, execution.authMode, execution.accountPlan);
+    Object.assign(execution, selection);
     const { model, reasoning } = execution;
     if (closing) throw new Error('Bridge is shutting down; resume required');
     const g = ++generation;
-    const s: Session = { threadId, cwd, model, reasoning, id: resume ? string(p.providerThreadId) : '', generation: g,
+    const s: Session = { threadId, cwd, model, reasoning, availableModels: selection?.availableModels, id: resume ? string(p.providerThreadId) : '', generation: g,
       auth: setup.auth, refreshAuth: setup.refreshAuth, beforeInput: setup.beforeInput, state: new ConversationState(warning(threadId)), decoder: new FrameDecoder(warning(threadId)),
       lifecycle: null, correlation: new CommandCorrelation(), detached: false, closing: false, subscription: null,
       options: execution.signature, construction: { ...p }, memoryEnabled: execution.memoryEnabled, instructionMode: String(p.instructionMode), timers: new Map(),
@@ -367,6 +414,7 @@ export function createZCodeBridge(services: BridgeServices, write: (message: unk
       knowledge: new SessionKnowledge(setup.knowledgeStore), skillRoots: structuredClone(skillRoots), bbSkills: [],
       mentionCatalogues: new Map(), child: null as unknown as NativeProcess };
     sessions.set(threadId, s);
+    let attachStage = 'configure';
     try {
       s.child = new NativeProcess(setup.launch, g, threadId, (m, gen) => {
         try { nativeMessage(s, m, gen); } catch { void died(s, new Error('Native projection failed; reconcile before retry'), gen); }
@@ -376,6 +424,7 @@ export function createZCodeBridge(services: BridgeServices, write: (message: unk
       }); });
       await setup.configure(s.child);
       if (!resume) {
+        attachStage = 'create';
         setup.markCreatePending?.();
         const snapshot = record(await s.child.request('session/create', {
           workspace: { workspacePath: cwd, workspaceKey: cwd }, mode: 'yolo', persistence: 'deferred',
@@ -388,6 +437,7 @@ export function createZCodeBridge(services: BridgeServices, write: (message: unk
       if (resume) {
         // A new process has no resident session. Apply options before V4
         // subscribe can load a resident with the native default tool set.
+        attachStage = 'resume';
         await s.child.request('session/resume', { sessionId: s.id,
           workspace: { workspacePath: cwd, workspaceKey: cwd }, toolDenylist: execution.toolDenylist });
         send('thread/identity', { threadId, providerThreadId: s.id });
@@ -398,15 +448,22 @@ export function createZCodeBridge(services: BridgeServices, write: (message: unk
       if (compatibilityMessage) send('thread/delta', { threadId, deltas: [{ kind: 'provider.warning', category: 'general', summary: compatibilityMessage }] });
       const startGuidance = !resume && execution.authMode === 'desktop' ? services.startGuidance?.() : null;
       if (startGuidance) send('thread/delta', { threadId, deltas: [{ kind: 'provider.warning', category: 'general', summary: startGuidance }] });
+      attachStage = 'subscribe';
       await s.child.request('v4/conversation/subscribe', { topic: `conversation/${s.id}`, connectionId: randomUUID(),
         clientMode: 'desktop-continuous', workspace: { workspacePath: cwd, workspaceKey: cwd } });
       await waitSnapshot(s);
+      attachStage = 'ready';
       await setup.readySession?.(s.child, s.id);
       for (const summary of setup.warnings ?? []) send('thread/delta', { threadId,
         deltas: [{ kind: 'provider.warning', category: 'general', summary }] });
       return { providerThreadId: s.id };
     } catch (e) {
-      if (s.id) send('error', { threadId, providerThreadId: s.id, message: 'Native attach failed; preserve identity and reconcile binding before retry' });
+      services.observe?.({ event: 'native-attach-failed', threadId, sessionId: s.id, stage: attachStage, timeout: e instanceof NativeRequestTimeout });
+      if (resume && e instanceof NativeRequestTimeout) send('thread/delta', { threadId, deltas: [threadDeltaSchema.parse({
+        kind: 'provider.error', category: 'connection-failed',
+        errorInfo: { category: 'connection-failed', providerCode: 'native-resume-timeout', httpStatusCode: null },
+        message: 'ZCode session reconnection timed out; the existing session is preserved.' })] });
+      else if (s.id) send('error', { threadId, providerThreadId: s.id, message: 'Native session attachment failed; existing session identity preserved.' });
       closePending(s);
       if (s.child) await s.child.close(); s.detached = true; sessions.delete(threadId); throw e;
     }
@@ -420,7 +477,7 @@ export function createZCodeBridge(services: BridgeServices, write: (message: unk
       s.compactions.settle('failed');
       if (s.lifecycle) await s.lifecycle.processDied(g, s.id, s.correlation);
       send('error', { threadId: s.threadId, providerThreadId: s.id, message: error.message });
-    } finally { await s.child.close(); s.detached = true; }
+    } finally { await s.child.close(); s.detached = true; if (sessions.get(s.threadId) === s) sessions.delete(s.threadId); }
   }
   function stop(s: Session, intent: 'interrupt' | 'release'): Promise<void> {
     return s.stopping ??= stopOwned(s, intent);
@@ -549,7 +606,8 @@ export function createZCodeBridge(services: BridgeServices, write: (message: unk
       const execution = currentExecution(reconciledOptions, s.instructionMode, s.construction.disallowedTools);
       if (execution.envVars.BB_THREAD_ID !== undefined && execution.envVars.BB_THREAD_ID !== p.threadId)
         throw new Error('Environment thread identity conflict');
-      Object.assign(execution, await services.validateSelection(execution.model, execution.reasoning, execution.authMode, execution.accountPlan));
+      const selection = await services.validateSelection(execution.model, execution.reasoning, execution.authMode, execution.accountPlan);
+    Object.assign(execution, selection);
       if (execution.signature !== s.options) {
         const construction = s.construction, id = s.id, before = s.state.snapshot;
         await stop(s, 'release');
@@ -588,6 +646,8 @@ export function createZCodeBridge(services: BridgeServices, write: (message: unk
         requireImageCapability(Array.isArray(models) ? models : [], execution.model);
       }
       const attachmentRefs = await createAttachmentRefs(converted.attachments, s.id, (method, params) => s.child.request(method, params));
+      s.lifecycle?.requestFailure(undefined, undefined, s.generation, s.id);
+      delete s.deferredHeaderFailure;
       const id = randomUUID(); s.correlation.begin(id, p.clientRequestId, s.generation, Date.now() + 60_000);
       const pendingSession = s, pendingGeneration = s.generation;
       const unresolved = setTimeout(() => {
@@ -600,6 +660,7 @@ export function createZCodeBridge(services: BridgeServices, write: (message: unk
         services.observe?.({ event: 'turn-requested-selection', threadId: s.threadId, sessionId: s.id, commandId: id,
         pid: s.child.child.pid, model: execution.model, reasoning: execution.reasoning });
       try {
+        s.availableModels = selection?.availableModels;
         s.model = execution.model;
         s.reasoning = execution.reasoning;
         s.child.activity('active');

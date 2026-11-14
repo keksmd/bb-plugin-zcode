@@ -29,6 +29,7 @@ export class SessionLifecycle {
   private backgrounds: BackgroundTasks;
   private subagents: Subagents;
   private cwd: string;
+  private requestError: { turnId: string; error: Extract<ThreadDelta, { kind: 'provider.error' }> } | undefined;
   constructor(threadId: string, sessionId: string, epoch: string, generation: number, warn: Warn,
     write: (message: ComponentMessage) => void, release: () => Promise<number>, cwd = '', taskStore?: string) {
     this.threadId = string(threadId); this.sessionId = string(sessionId); this.epoch = string(epoch);
@@ -60,9 +61,18 @@ export class SessionLifecycle {
     this.deltas(this.backgrounds.baseline(snapshot));
     this.backgrounds.recoveryDelivered();
   }
+  requestFailure(turnId: string | undefined, error: Extract<ThreadDelta, { kind: 'provider.error' }> | undefined, generation: number, sessionId: string): void {
+    if (!this.current(generation, sessionId) || this.ended) return;
+    if (turnId && error) this.requestError = { turnId, error };
+    else if (turnId === undefined || this.requestError?.turnId === turnId) this.requestError = undefined;
+  }
   project(snapshot: Snapshot, generation: number, sessionId: string, correlation?: CommandCorrelation): void {
     if (!this.current(generation, sessionId) || this.ended) return;
-    const ds = this.translator.project(snapshot, generation, correlation);
+    const requestError = this.requestError;
+    const ds = this.translator.project(snapshot, generation, correlation).map(delta =>
+      requestError && delta.kind === 'provider.error' && delta.providerTurnId === requestError.turnId && delta.errorInfo?.providerCode === 'model_request_failed'
+        ? threadDeltaSchema.parse({ ...requestError.error, providerTurnId: delta.providerTurnId }) : delta);
+    if (ds.some(delta => delta.kind === 'turn.boundary' && delta.providerTurnId === this.requestError?.turnId)) this.requestError = undefined;
     // Open parent tools before child delegations, close children before boundary.
     this.deltas(ds.filter(d => d.kind !== 'turn.boundary'));
     this.deltas(this.subagents.project(snapshot, ds));
@@ -102,6 +112,9 @@ export class SessionLifecycle {
   }
   async processDied(generation: number, sessionId: string, correlation?: CommandCorrelation): Promise<void> {
     if (!this.current(generation, sessionId) || this.ended) return;
+    this.deltas([threadDeltaSchema.parse({ kind: 'provider.error', category: 'connection-failed',
+      errorInfo: { category: 'connection-failed', providerCode: 'native-child-exited', httpStatusCode: null },
+      message: 'ZCode connection closed unexpectedly; the same session can be resumed.' })]);
     this.finish('failed', correlation);
     const params = { threadId: this.threadId, providerThreadId: this.sessionId, message: 'Native child exited unexpectedly; resume required' };
     const message = { jsonrpc: '2.0' as const, method: 'error', params };
@@ -132,6 +145,6 @@ export class SessionLifecycle {
     this.translator = new EventTranslator(sessionId, epoch, generation, this.warn, this.cwd);
     this.backgrounds = new BackgroundTasks(sessionId, this.warn);
     this.subagents = new Subagents(sessionId, epoch, this.warn);
-    this.attached = true; this.ended = false; this.cleanup = null;
+    this.attached = true; this.ended = false; this.cleanup = null; this.requestError = undefined;
   }
 }

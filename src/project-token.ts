@@ -7,14 +7,37 @@ import { readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { record, string } from './errors.ts';
 
+type TokenDiagnostics = { method?: 'GET' | 'POST'; path?: string; status?: number; networkCode?: string };
+const tokenPaths = new Set(['/api/biz/customer/getCustomerInfo', '/api/biz/v1/organization/:organizationId/projects/:projectId/api_keys', '/api/biz/v1/organization/:organizationId/projects/:projectId/api_keys/:apiKeyId/access_tokens']);
+const transportCodes = new Set(['ABORT_ERR', 'ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN', 'ENOTFOUND', 'ECONNREFUSED', 'EHOSTUNREACH', 'ENETUNREACH', 'ECONNABORTED', 'EPIPE', 'ENOENT', 'EACCES', 'ERR_STREAM_PREMATURE_CLOSE', 'ERR_TLS_CERT_ALTNAME_INVALID', 'CERT_HAS_EXPIRED', 'DEPTH_ZERO_SELF_SIGNED_CERT', 'SELF_SIGNED_CERT_IN_CHAIN', 'UNABLE_TO_VERIFY_LEAF_SIGNATURE', 'UNABLE_TO_GET_ISSUER_CERT_LOCALLY', 'ERR_SSL_SSLV3_ALERT_HANDSHAKE_FAILURE']);
 export class ProjectTokenError extends Error {
   readonly code: string;
   readonly transient: boolean;
-  constructor(code: string, transient = false) { super(code); this.code = code; this.transient = transient; }
+  readonly diagnostics: Readonly<TokenDiagnostics>;
+  constructor(code: string, transient = false, diagnostics: TokenDiagnostics = {}) {
+    super(code); this.code = code; this.transient = transient;
+    this.diagnostics = Object.freeze({
+      ...(['GET', 'POST'].includes(diagnostics.method ?? '') ? { method: diagnostics.method } : {}),
+      ...(tokenPaths.has(diagnostics.path ?? '') ? { path: diagnostics.path } : {}),
+      ...(Number.isInteger(diagnostics.status) && Number(diagnostics.status) >= 100 && Number(diagnostics.status) <= 599 ? { status: diagnostics.status } : {}),
+      ...(transportCodes.has(diagnostics.networkCode ?? '') ? { networkCode: diagnostics.networkCode } : {}),
+    });
+  }
 }
 export type TokenRequest = (path: string, method: 'GET' | 'POST', headers: Record<string, string>, body?: unknown) => Promise<unknown>;
 export function tokenRequest(env: NodeJS.ProcessEnv, onDate?: (date: string | undefined) => void): TokenRequest {
   return (path, method, headers, body) => new Promise((resolve, reject) => {
+    const route = path === '/api/biz/customer/getCustomerInfo' ? path
+      : /^\/api\/biz\/v1\/organization\/[^/]+\/projects\/[^/]+\/api_keys$/.test(path) ? '/api/biz/v1/organization/:organizationId/projects/:projectId/api_keys'
+      : /^\/api\/biz\/v1\/organization\/[^/]+\/projects\/[^/]+\/api_keys\/[^/]+\/access_tokens$/.test(path) ? '/api/biz/v1/organization/:organizationId/projects/:projectId/api_keys/:apiKeyId/access_tokens' : undefined;
+    const diagnostics = { method, ...(route ? { path: route } : {}) };
+    const failed = (error: unknown, status?: number) => {
+      const networkCode = error && typeof error === 'object' ? String((error as NodeJS.ErrnoException).code ?? '') : undefined;
+      const transient = status !== undefined && status >= 400 ? status === 429 || status >= 500 : !['ENOENT', 'EACCES'].includes(networkCode ?? '');
+      return new ProjectTokenError(status === 401 ? 'project_token_login_failed' : 'project_token_request_failed', transient, {
+        ...diagnostics, ...(status ? { status } : {}), ...(networkCode ? { networkCode } : {}) });
+    };
+    try {
     const ca = env.ZCODE_AGENT_CA_CERT;
     const agent = new Agent({ proxyEnv: { ...env, ...(env.ZCODE_HTTP_PROXY ? { HTTPS_PROXY: env.ZCODE_HTTP_PROXY, https_proxy: env.ZCODE_HTTP_PROXY } : {}) },
       ...(ca ? { ca: [...rootCertificates, readFileSync(ca, 'utf8')] } : {}) });
@@ -22,18 +45,20 @@ export function tokenRequest(env: NodeJS.ProcessEnv, onDate?: (date: string | un
       onDate?.(response.headers.date);
       const chunks: Buffer[] = [];
       response.on('data', (chunk: Buffer) => { chunks.push(chunk); });
-      response.on('error', reject);
+      response.on('error', error => reject(failed(error, response.statusCode)));
+      response.on('aborted', () => reject(failed({ code: 'ERR_STREAM_PREMATURE_CLOSE' }, response.statusCode)));
       response.on('end', () => {
         const status = response.statusCode ?? 0;
         if (status === 404) { resolve({ code: 404 }); return; }
-        if (status < 200 || status >= 300) { reject(new ProjectTokenError(status === 401 ? 'project_token_login_failed' : 'project_token_request_failed', status === 429 || status >= 500)); return; }
+        if (status < 200 || status >= 300) { reject(new ProjectTokenError(status === 401 ? 'project_token_login_failed' : 'project_token_request_failed', status === 429 || status >= 500, { ...diagnostics, status })); return; }
         try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))); }
-        catch { reject(new ProjectTokenError('project_token_invalid_response')); }
+        catch { reject(new ProjectTokenError('project_token_invalid_response', false, { ...diagnostics, status })); }
       });
     });
-    req.on('error', error => reject(error instanceof ProjectTokenError ? error : new ProjectTokenError('project_token_request_failed', true)));
+    req.on('error', error => reject(error instanceof ProjectTokenError ? error : failed(error)));
     req.on('close', () => agent.destroy());
     req.end(body === undefined ? undefined : JSON.stringify(body));
+    } catch (error) { reject(failed(error)); }
   });
 }
 const sha = (text: string) => createHash('sha256').update(text).digest('hex');

@@ -177,8 +177,8 @@ export function createNativeServices(initialRoot = join(homedir(), '.local/share
   const persistentCatalogue = dependencies.catalogueCache ?? !dependencies.configure;
   function cacheScope(d: ReturnType<typeof discovery>, mode: AuthMode = 'desktop', plan: AccountPlan = 'coding-plan'): string {
     const paths = getPaths();
-    const scope = JSON.stringify({ version: 5, semantics: 'zai-selected-plan-session-create-v1', plan, root, runtime: d.sha256, cli: d.version, mode,
-      credentialFileIdentity: fileIdentity(mode === 'desktop' ? [auth.path] : explicitKeyPath ? [explicitKeyPath] : []),
+    const scope = JSON.stringify({ version: 7, semantics: 'zai-selected-plan-session-create-v1', plan, root, runtime: d.sha256, mode,
+      ...(plan === 'start-plan' ? { credentialFileIdentity: fileIdentity(mode === 'desktop' ? [auth.path] : explicitKeyPath ? [explicitKeyPath] : []) } : {}),
       desktop: desktopVersion(compatibilityFiles(paths)[3]!), config: fileIdentity([join(dependencies.personalHome ?? homedir(), '.zcode/cli/config.json'), join(dependencies.personalHome ?? homedir(), '.zcode/v2/telemetry-state.json')]),
       builtin: createHash('sha256').update(readFileSync(paths.builtin)).digest('hex') });
     selectedAuth(mode, plan).read('catalogue-cache-validation');
@@ -489,7 +489,7 @@ export function createNativeServices(initialRoot = join(homedir(), '.local/share
       const selected = model ? available.find(m => m.model === model) : available.find(m => m.isDefault);
       const effort = reasoning || selected?.defaultReasoningEffort;
       if (!selected || !effort || !selected.supportedReasoningEfforts.some(e => e.reasoningEffort === effort)) throw new Error('Selected model/reasoning unavailable; models with a default reasoning level unsupported by bb SDK cannot be used. No fallback');
-      return { model: selected.model, reasoning: effort };
+      return { model: selected.model, reasoning: effort, availableModels: available.map(candidate => candidate.model) };
     },
   };
   async function loadCatalogue(loadRoot: string, mode: AuthMode = 'desktop', plan: AccountPlan = 'coding-plan'): Promise<Catalogue> {

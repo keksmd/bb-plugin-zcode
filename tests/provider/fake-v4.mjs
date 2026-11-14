@@ -125,7 +125,7 @@ if (mode === 'v4') {
         const s = sessions[id], text = p.payload.text.startsWith('[bb session instructions]\n') ? p.payload.text.split('\n\n').slice(1).join('\n\n') : p.payload.text, turnId = randomUUID(), rowId = s.rows.totalCount + 1;
         s.lastSendText = p.payload.text;
         s.config = { ...s.config, modelSelection: p.payload.modelSelection };
-        const wait = ['/wait-for-interrupt', '/question', '/permission'].includes(text), zero = text === '/clear' || text === '/zero-before-ack';
+        const wait = ['/wait-for-interrupt', '/question', '/permission', '/auth-before-frame', '/auth-before-terminal', '/auth-before-wrong'].includes(text), zero = text === '/clear' || text === '/zero-before-ack';
         // Headerless/messageId cases are synthetic schema diagnostics only.
         const headerless = text === '/synthetic-headerless';
         if (!headerless) {
@@ -145,7 +145,20 @@ if (mode === 'v4') {
         reply(m.id, { status: 'accepted', result: { type: 'inputAccepted', delivery: 'startNow', inputId: p.commandId,
           ...(text === '/synthetic-different-message' || headerless ? { messageId: 'synthetic-not-turn-id' } : {}) } });
         if (text === '/synthetic-different-message') setTimeout(frame, 40);
-        else if (text !== '/zero-before-ack') frame();
+        else if (text === '/auth-before-frame' || text === '/auth-before-terminal' || text === '/auth-before-wrong') {
+          process.stdout.write(JSON.stringify({ id: 'reverse-auth', method: 'interaction/requestProviderRuntimeHeaders', params: {
+            providerId: 'account:zai-individual-coding-plan', accountAccess: { type: 'zhipu-account', mode: 'individual-coding-plan', accountType: 'zai', entitled: true },
+            modelSelection: { providerId: 'account:zai-individual-coding-plan', modelId: 'GLM-5.3' }, sessionId: id,
+            reason: 'model-request', requestId: 'synthetic-before-frame', workspace: { workspacePath: process.cwd(), workspaceKey: process.cwd() } } }) + '\n');
+          if (text === '/auth-before-wrong') s.rows.window.find(row => row.turnId === turnId && row.kind === 'turnHeader').sourceCommandId = 'different-command';
+          setTimeout(() => {
+            if (text === '/auth-before-terminal') {
+              s.rows.window.find(row => row.turnId === turnId && row.kind === 'turnHeader').state = 'failed';
+              s.control = { phase: 'error', activeWorks: [], lastError: { code: 'model_request_failed' } };
+            }
+            frame();
+          }, 20);
+        } else if (text !== '/zero-before-ack') frame();
         if (text === '/question') {
           question = { id: 'native-question-' + turnId, turnId };
           // OSS rows.ts191/snapshot.ts310 + actual M2: distinct namespaces,
@@ -186,6 +199,12 @@ if (mode === 'v4') {
       const s = sessions[id];
       for (const r of s.rows.window) if (r.kind === 'turnHeader') r.state = 'completedSuccess';
       s.control = { phase: 'completedSuccess', activeWorks: [] }; persist(); frame(); reply(m.id, {});
+    }
+    else if (m.method === 'fixture/fail') {
+      const s = sessions[id];
+      for (const row of s.rows.window) if (row.kind === 'turnHeader' && row.state === 'running') row.state = 'failed';
+      s.control = { phase: 'error', activeWorks: [], lastError: p.lastError ?? { code: 'model_request_failed' } };
+      persist(); frame(); reply(m.id, {});
     }
     else if (m.method === 'fixture/preferences') {
       process.stdout.write(JSON.stringify({ id: 'fixture-preferences', method: 'session/requestRuntimePreferences', params: { sessionId: id, scope: 'runtime-memory' } }) + '\n');

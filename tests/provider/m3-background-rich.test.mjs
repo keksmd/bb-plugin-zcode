@@ -128,3 +128,25 @@ test('supervisor activity control stays separate from native stdin and Stop sett
     assert.deepEqual(messages,[]); assert.deepEqual(death,[]); assert.equal(await p.close(),0);
   } finally { await p.close(); }
 });
+test('background work retains the observed Bash turn when its anchor leaves the native row window', () => {
+  const warnings=[], t=new api.BackgroundTasks('session1',d=>warnings.push(d.code));
+  t.baseline({...snapshot(),backgroundWorks:[]});
+  t.project({...snapshot(rs('running')),backgroundWorks:[]});
+  const ds=t.project({...snapshot([{rowId:3,kind:'assistantText',turnId:'next',text:'next'}]),backgroundWorks:[work('running')]});
+  const opened=ds.find(d=>d.kind==='item.open');
+  assert.equal(opened.providerTurnId,'turn1');assert.equal(opened.item.description,'sleep 5');
+  const completed=t.project({...snapshot(),backgroundWorks:[work('resultPending')]});
+  assert.equal(completed.find(d=>d.kind==='item.close').item.taskStatus,'completed');
+  assert.deepEqual(warnings,[]);
+});
+test('missing background anchors wait for native evidence and warn once only when terminal or at the foreground boundary', () => {
+  const warnings=[], t=new api.BackgroundTasks('session1',d=>warnings.push(d.code));
+  t.baseline({...snapshot(),backgroundWorks:[]});
+  const waiting={...snapshot(),backgroundWorks:[work('running')]};
+  assert.deepEqual(t.project(waiting),[]);assert.deepEqual(t.project(waiting),[]);assert.deepEqual(warnings,[]);
+  assert.deepEqual(t.project(waiting,true),[]);assert.deepEqual(t.project(waiting,true),[]);
+  assert.deepEqual(warnings,['background-anchor-unavailable']);
+  const recovered=t.project(snap('running','running'));
+  assert.equal(recovered.find(d=>d.kind==='item.open').providerTurnId,'turn1');
+  assert.equal(recovered.some(d=>d.kind==='item.close'),false);
+});

@@ -46,24 +46,29 @@ test('M493 complete command quotes all paths; no PATH zcode; all login surfaces 
   } finally { rmSync(root, { recursive: true }); }
 });
 
-for (const persistent of [false, true]) test(`M493 login file appears, changes, disappears: automatic catalogue refresh (${persistent})`, async () => {
+for (const persistent of [false, true]) test(`M493 login file appears, changes, disappears: fresh authentication with stable public catalogue (${persistent})`, async () => {
   const root = mkdtempSync(join(tmpdir(), 'm493-login-')), builtin = join(root, 'builtin.json'); writeFileSync(builtin, '{}');
   const auth = new api.ReadOnlyAuth(join(root, 'credentials.json')); let launches = 0;
   const runtime = api.createNativeServices(join(root, 'service'), { auth, catalogueCache: persistent,
     discovery: () => ({ installed: true, supported: true, sha256: 'synthetic', version: 'synthetic' }),
     paths: { executable: process.execPath, script: resolve('tests/provider/fake-v4.mjs'), builtin },
     configure: async child => { launches++; await child.request('runtime/capabilities', {}); } });
-  const put = identity => writeFileSync(auth.path, JSON.stringify({ [`account-provider:${api.accountProviderId}:auth-source`]: 'manual', [`account-provider:${api.accountProviderId}:identity`]: identity,
-    [`account-provider:coding-plan:${api.accountProviderId}:account:${identity}:api-key`]: 'SYNTHETIC_M493_KEY' }));
+  const put = (identity, key = 'SYNTHETIC_M493_KEY') => writeFileSync(auth.path, JSON.stringify({ [`account-provider:${api.accountProviderId}:auth-source`]: 'manual', [`account-provider:${api.accountProviderId}:identity`]: identity,
+    [`account-provider:coding-plan:${api.accountProviderId}:account:${identity}:api-key`]: key }));
   try {
     assert.equal((await runtime.services.health()).health.status, 'unauthenticated');
     await assert.rejects(runtime.services.models(undefined, 'desktop'), e => e.kind === 'unauthenticated'); assert.equal(launches, 0);
     put('first'); const before = readFileSync(auth.path); const first = await runtime.services.models(undefined, 'desktop');
     assert.ok(first.models.length); assert.equal(launches, 1); assert.deepEqual(readFileSync(auth.path), before);
     await runtime.services.models(undefined, 'desktop'); assert.equal(launches, 1);
-    put('changed'); await runtime.services.models(undefined, 'desktop'); assert.equal(launches, 2);
+    const reads = auth.reads;
+    put('changed', 'SYNTHETIC_M493_ROTATED_KEY'); await runtime.services.models(undefined, 'desktop'); assert.equal(launches, persistent ? 1 : 2);
+    assert.ok(auth.reads > reads); assert.equal(auth.read().apiKey, 'SYNTHETIC_M493_ROTATED_KEY');
+    const changed = JSON.parse(readFileSync(auth.path, 'utf8')); changed[`account-provider:${api.accountProviderId}:auth-source`] = 'oauth';
+    writeFileSync(auth.path, JSON.stringify(changed));
+    await assert.rejects(runtime.services.models(undefined, 'desktop'), e => e.kind === 'unauthenticated');
     unlinkSync(auth.path); await assert.rejects(runtime.services.models(undefined, 'desktop'), e => e.kind === 'unauthenticated');
-    put('return'); await runtime.services.models(undefined, 'desktop'); assert.equal(launches, 3);
+    put('return'); await runtime.services.models(undefined, 'desktop'); assert.equal(launches, persistent ? 1 : 3);
   } finally { await runtime.close(); rmSync(root, { recursive: true }); }
 });
 

@@ -203,8 +203,9 @@ test('B-13 death closes every turn/item/background/delegation as failed; stale c
 test('B-13 death of accepted zero-work before projection still gives open/accepted/failed exactly once', async () => {
   const { l, messages } = lifecycle(), c = inputs([rows()[0]]);
   await l.processDied(1, 'session1', c);
-  assert.deepEqual(messages[0].params.deltas.map(d => d.kind), ['turn.open', 'input.accepted', 'turn.boundary']);
-  assert.equal(messages[0].params.deltas.at(-1).status, 'failed'); verifiedMessages(messages);
+  assert.equal(messages[0].params.deltas[0].errorInfo.category, 'connection-failed');
+  assert.deepEqual(messages[1].params.deltas.map(d => d.kind), ['turn.open', 'input.accepted', 'turn.boundary']);
+  assert.equal(messages[1].params.deltas.at(-1).status, 'failed'); verifiedMessages(messages);
 });
 test('B-13 replacement settles before reset/replaced, proven same context only, next resume baseline', async () => {
   for (const preserved of [true, undefined, false]) {

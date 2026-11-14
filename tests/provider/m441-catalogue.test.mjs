@@ -30,7 +30,7 @@ test('native schema evolution preserves new model/levels/default; removed prefer
  assert.equal(nativeEffort.defaultReasoningEffort,'native-unknown');
  assert.deepEqual(nativeEffort.supportedReasoningEfforts.map(e=>e.reasoningEffort),['native-unknown']);
 });
-test('actual loader uses single unselected create, defaults distinguish explicit missing choice, credential/config/mode refresh and no inference',async()=>{
+test('actual loader uses single unselected create, defaults distinguish explicit missing choice, credential rotation preserves public catalogue, config/mode refresh and no inference',async()=>{
  const base=resolve(process.env.ZCODE_CONNECTION_TEST_ROOT??'.local/M4.4.1/offline');mkdirSync(base,{recursive:true});
  const root=mkdtempSync(join(base,'evolution-')),builtin=join(root,'builtin.json');writeFileSync(builtin,'{}');
  const auth=new api.ReadOnlyAuth(join(root,'credential.json'));writeFileSync(auth.path,'{}');let reads=0,creates=0,inferences=0,launches=0;
@@ -47,18 +47,20 @@ test('actual loader uses single unselected create, defaults distinguish explicit
  try{
   const options=api.executionOptions({permissionMode:'full',permissionScope:'full',approvalReviewer:null,permissionEscalation:null});
   assert.equal(options.model,'');assert.equal(options.reasoning,'');
-  assert.deepEqual(await runtime.services.validateSelection(options.model,options.reasoning),{model:'GLM-Future',reasoning:'medium'});
-  assert.deepEqual(await runtime.services.validateSelection('GLM-Future','xhigh'),{model:'GLM-Future',reasoning:'xhigh'});
+  assert.deepEqual(await runtime.services.validateSelection(options.model,options.reasoning),{model:'GLM-Future',reasoning:'medium',availableModels:['GLM-Future']});
+  assert.deepEqual(await runtime.services.validateSelection('GLM-Future','xhigh'),{model:'GLM-Future',reasoning:'xhigh',availableModels:['GLM-Future']});
   await assert.rejects(runtime.services.validateSelection('GLM-5.3','max'),/unavailable/);
   await assert.rejects(runtime.services.validateSelection('GLM-5.3','medium'),/unavailable/);
   await assert.rejects(runtime.services.validateSelection('GLM-Future','max'),/unavailable/);
   assert.equal(creates,1);assert.equal(launches,1);assert.equal(inferences,0);
   const before=reads;await runtime.services.models();assert.ok(reads>before);
   models=fixture.models;nativeDefault=fixture.nativeDefault;writeFileSync(auth.path,'{"identity":"synthetic-change"}');
+  assert.equal((await runtime.services.validateSelection('','')).model,'GLM-Future');assert.equal(creates,1);
+  writeFileSync(builtin,'{"nativeChange":true}');
   assert.equal((await runtime.services.validateSelection('','')).model,'GLM-5.3');assert.equal(creates,2);
   await assert.rejects(runtime.services.validateSelection('GLM-Future','medium'),/unavailable/);assert.equal(inferences,0);
   await assert.rejects(runtime.services.validateSelection('GLM-Future','max'),/unavailable/);
-  writeFileSync(builtin,'{"nativeChange":true}');await runtime.services.models();assert.equal(creates,3);
+  writeFileSync(builtin,'{"nativeChange":2}');await runtime.services.models();assert.equal(creates,3);
   const key=join(root,'secrets');mkdirSync(key);writeFileSync(join(key,'backupKey'),'SYNTHETIC_ONLY',{mode:0o600});runtime.setSecretRoot(key);
   await runtime.services.models(undefined,'coding-plan-key');assert.equal(creates,4);
  }finally{await runtime.close();rmSync(root,{recursive:true});}
@@ -72,4 +74,49 @@ test('fresh native header binding accepts catalogue-selected future model and re
  assert.equal(auth.headers(nativeShape,'own','/own','GLM-Future','medium').headersApplied,true);assert.equal(reads,2);
  for(const bad of [{...p,modelSelection:{...p.modelSelection,modelId:'gone'}},{...p,modelSelection:{...p.modelSelection,options:{reasoningLevel:'max'}}},{...p,accountAccess:{...p.accountAccess,entitled:false}},{...p,sessionId:'other'},{...p,workspace:{workspacePath:'/other',workspaceKey:'/other'}}])assert.throws(()=>auth.headers(bad,'own','/own','GLM-Future','medium'));
  assert.equal(reads,2);
+});
+test('Coding Plan credential refresh during native catalogue load stays valid; cache never bypasses removed authentication', async () => {
+ const base=resolve(process.env.ZCODE_CONNECTION_TEST_ROOT??'.local/M4.4.1/offline');mkdirSync(base,{recursive:true});
+ const root=mkdtempSync(join(base,'rotation-')),builtin=join(root,'builtin.json'),credential=join(root,'credential.json');
+ writeFileSync(builtin,'{}');writeFileSync(credential,'{}');
+ const auth=new api.ReadOnlyAuth(credential);let authenticated=true,creates=0;
+ auth.read=()=>{if(!authenticated)throw new api.AuthError('unauthenticated');return{apiKey:'SYNTHETIC_ONLY'};};
+ const runtime=api.createNativeServices(join(root,'service'),{auth,catalogueCache:true,
+  discovery:()=>({installed:true,supported:true,sha256:'synthetic',version:'synthetic'}),
+  paths:{executable:process.execPath,script:resolve('tests/provider/fake-v4.mjs'),builtin},
+  configure:async child=>{await child.request('runtime/capabilities',{});const request=child.request.bind(child);child.request=async(method,params)=>{
+   if(method==='session/create'){creates++;writeFileSync(credential,'{"rotated":true}');return{settings:{model:{available:fixture.models,current:fixture.nativeDefault}}};}
+   return request(method,params);
+  };}});
+ try{
+  assert.ok((await runtime.services.models()).models.length);assert.equal(creates,1);
+  assert.ok((await runtime.services.models()).models.length);assert.equal(creates,1);
+  authenticated=false;await assert.rejects(runtime.services.models(),/unauthenticated/);assert.equal(creates,1);
+ }finally{await runtime.close();rmSync(root,{recursive:true});}
+});
+
+test('CLI diagnostic timeout cannot invalidate a validated catalogue; runtime change still reloads and authentication remains fresh', async () => {
+ const base=resolve(process.env.ZCODE_CONNECTION_TEST_ROOT??'.local/M4.4.1/offline');mkdirSync(base,{recursive:true});
+ const root=mkdtempSync(join(base,'cli-diagnostic-')),builtin=join(root,'builtin.json'),credential=join(root,'credential.json');
+ writeFileSync(builtin,'{}');writeFileSync(credential,'{}');
+ const auth=new api.ReadOnlyAuth(credential);let authenticated=true,creates=0,cliVersion='0.17.1',runtimeSha='synthetic-one';
+ auth.read=()=>{if(!authenticated)throw new api.AuthError('unauthenticated');return{apiKey:'SYNTHETIC_ONLY'};};
+ const dependencies={auth,catalogueCache:true,
+  discovery:()=>({installed:true,supported:true,sha256:runtimeSha,version:cliVersion}),
+  paths:{executable:process.execPath,script:resolve('tests/provider/fake-v4.mjs'),builtin},
+  configure:async child=>{await child.request('runtime/capabilities',{});const request=child.request.bind(child);child.request=async(method,params)=>{
+   if(method==='session/create'){creates++;cliVersion=null;return{settings:{model:{available:fixture.models,current:fixture.nativeDefault}}};}
+   return request(method,params);
+  };}};
+ let runtime=api.createNativeServices(join(root,'service'),dependencies);
+ try{
+  const selected=await runtime.services.validateSelection('GLM-5.3','high');
+  assert.deepEqual(selected.availableModels,api.mapNativeModels(fixture.models,fixture.nativeDefault).map(model=>model.model));
+  assert.equal(creates,1);
+  cliVersion='0.17.1';await runtime.services.models();assert.equal(creates,1);
+  await runtime.close();runtime=api.createNativeServices(join(root,'service'),dependencies);
+  cliVersion=null;await runtime.services.models();assert.equal(creates,1);
+  runtimeSha='synthetic-two';await runtime.services.models();assert.equal(creates,2);
+  authenticated=false;await assert.rejects(runtime.services.models(),/unauthenticated/);assert.equal(creates,2);
+ }finally{await runtime.close();rmSync(root,{recursive:true});}
 });
